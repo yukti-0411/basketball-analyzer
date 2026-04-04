@@ -3,7 +3,7 @@ import mediapipe as mp
 
 
 # ====== CHANGE THESE TWO PATHS ======
-input_video_path = "test_video.mp4"
+input_video_path = "test_video1.mp4"
 output_video_path = "output_with_skeleton.mp4"
 # ====================================
 
@@ -66,10 +66,10 @@ with mp_pose.Pose(
                 results.pose_landmarks,
                 mp_pose.POSE_CONNECTIONS,
                 landmark_drawing_spec=mp_drawing.DrawingSpec(
-                    color=(0, 255, 0), thickness=1, circle_radius=1
+                    color=(0, 255, 0), thickness=2, circle_radius=2
                 ),
                 connection_drawing_spec=mp_drawing.DrawingSpec(
-                    color=(0, 0, 255), thickness=1
+                    color=(0, 0, 255), thickness=2
                 ),
             )
 

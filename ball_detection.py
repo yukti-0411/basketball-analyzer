@@ -4,7 +4,7 @@ from ultralytics import YOLO
 
 
 # ----- Paths and constants -----
-input_video_path = "test_video.mp4"
+input_video_path = "test_video1.mp4"
 output_video_path = "output_ball.mp4"
 
 # COCO "sports ball" in pretrained YOLO models.

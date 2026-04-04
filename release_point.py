@@ -1,26 +1,34 @@
+import math
+
 import cv2
 import mediapipe as mp
 import numpy as np
 from ultralytics import YOLO
 
+from angle_analysis import analyze_release_frame
+from feedback import generate_feedback
 
-# ----- Video paths -----
+
+# ----- Video and output -----
 input_video_path = "test_video1.mp4"
-output_video_path = "output_combined.mp4"
+release_image_path = "release_frame.jpg"
 
-# ----- Ball detection (YOLO + HSV fallback) -----
+# ----- Ball detection (same idea as analyzer.py) -----
 SPORTS_BALL_CLASS_ID = 32
 YOLO_MIN_CONF = 0.25
 HSV_ORANGE_LOWER = np.array([8, 80, 80], dtype=np.uint8)
 HSV_ORANGE_UPPER = np.array([28, 255, 255], dtype=np.uint8)
 MIN_ORANGE_AREA = 400
-
-# YOLOv8 extra-large — accurate but slower; downloads on first run.
 model = YOLO("yolov8x.pt")
 
-# MediaPipe shortcuts
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
+
+# ----- Release detection (tune for your camera / resolution) -----
+# "Near wrist": previous frame must be at least this close (pixels).
+NEAR_WRIST_FRAC = 0.35
+# "Sudden jump": distance must grow by at least this many pixels in one frame.
+JUMP_FRAC = 0.03
 
 
 def xyxy_to_xywh(x1, y1, x2, y2):
@@ -97,7 +105,22 @@ def create_csrt():
     return cv2.legacy.TrackerCSRT_create()
 
 
-# ----- Pass 1: find first frame where we can start ball tracking -----
+def distance_ball_to_closest_wrist(landmarks, frame_w, frame_h, ball_cx, ball_cy):
+    """Shortest pixel distance from ball center to left or right wrist (if visible)."""
+    best = None
+    for idx in (mp_pose.PoseLandmark.LEFT_WRIST, mp_pose.PoseLandmark.RIGHT_WRIST):
+        lm = landmarks.landmark[idx]
+        if lm.visibility < 0.5:
+            continue
+        wx = lm.x * frame_w
+        wy = lm.y * frame_h
+        d = math.hypot(ball_cx - wx, ball_cy - wy)
+        if best is None or d < best:
+            best = d
+    return best
+
+
+# ----- Pass 1: first frame with a ball (YOLO, then HSV) -----
 cap = cv2.VideoCapture(input_video_path)
 if not cap.isOpened():
     print(f"Error: Could not open input video: {input_video_path}")
@@ -105,9 +128,6 @@ if not cap.isOpened():
 
 frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps = cap.get(cv2.CAP_PROP_FPS)
-if fps <= 0:
-    fps = 30.0
 
 init_frame_index, init_bbox = find_ball_init_scan(cap, use_yolo=True)
 cap.release()
@@ -120,17 +140,24 @@ if init_frame_index is None:
     init_frame_index, init_bbox = find_ball_init_scan(cap, use_yolo=False)
     cap.release()
 
-# ----- Pass 2: pose + ball on every frame, one output video -----
-cap = cv2.VideoCapture(input_video_path)
-if not cap.isOpened():
-    print("Error: Could not open video for combined output pass.")
+if init_bbox is None:
+    print("Error: No ball found. Cannot estimate release.")
     raise SystemExit
 
-fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-out = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
+min_dim = min(frame_width, frame_height)
+near_wrist_max = NEAR_WRIST_FRAC * min_dim
+jump_min = JUMP_FRAC * min_dim
+
+# ----- Pass 2: track ball + pose, watch wrist–ball distance -----
+cap = cv2.VideoCapture(input_video_path)
+if not cap.isOpened():
+    print("Error: Could not open video for processing.")
+    raise SystemExit
 
 tracker = None
 frame_number = 0
+prev_dist = None
+release_found = False
 
 with mp_pose.Pose(
     static_image_mode=False,
@@ -144,29 +171,39 @@ with mp_pose.Pose(
         if not ok:
             break
 
-        # Tracker must see raw video pixels only (no skeleton or circle drawn yet).
         clean = frame.copy()
-
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pose_results = pose.process(frame_rgb)
 
         ball_bbox_xywh = None
-        if init_bbox is not None:
-            if frame_number < init_frame_index:
-                pass
-            elif frame_number == init_frame_index:
-                tracker = create_csrt()
-                x, y, w, h = init_bbox
-                if tracker.init(clean, (x, y, w, h)):
-                    ball_bbox_xywh = (x, y, w, h)
-                else:
-                    print("Warning: CSRT init failed; ball circle disabled.")
-                    tracker = None
-            elif tracker is not None:
-                success, bbox = tracker.update(clean)
-                if success:
-                    bx, by, bw, bh = bbox
-                    ball_bbox_xywh = (bx, by, bw, bh)
+        if frame_number < init_frame_index:
+            pass
+        elif frame_number == init_frame_index:
+            tracker = create_csrt()
+            x, y, w, h = init_bbox
+            if tracker.init(clean, (x, y, w, h)):
+                ball_bbox_xywh = (x, y, w, h)
+            else:
+                print("Error: CSRT init failed.")
+                tracker = None
+        elif tracker is not None:
+            success, bbox = tracker.update(clean)
+            if success:
+                bx, by, bw, bh = bbox
+                ball_bbox_xywh = (bx, by, bw, bh)
+
+        dist = None
+        if ball_bbox_xywh is not None and pose_results.pose_landmarks:
+            bx, by, bw, bh = ball_bbox_xywh
+            ball_cx = bx + bw / 2
+            ball_cy = by + bh / 2
+            dist = distance_ball_to_closest_wrist(
+                pose_results.pose_landmarks,
+                frame_width,
+                frame_height,
+                ball_cx,
+                ball_cy,
+            )
 
         if pose_results.pose_landmarks:
             mp_drawing.draw_landmarks(
@@ -185,13 +222,48 @@ with mp_pose.Pose(
             bx, by, bw, bh = ball_bbox_xywh
             draw_ball_circle(frame, bx, by, bw, bh)
 
-        out.write(frame)
+        if (
+            dist is not None
+            and prev_dist is not None
+            and prev_dist < near_wrist_max
+            and (dist - prev_dist) > jump_min
+        ):
+            cv2.imwrite(release_image_path, frame)
+            print(f"Release point frame number: {frame_number}")
+            print(f"Saved image: {release_image_path}")
+            if pose_results.pose_landmarks is not None and ball_bbox_xywh is not None:
+                metrics = analyze_release_frame(
+                    frame,
+                    pose_results.pose_landmarks,
+                    ball_bbox_xywh,
+                    frame_width,
+                    frame_height,
+                )
+                generate_feedback(
+                    metrics["elbow_angle_deg"],
+                    metrics["knee_angle_deg"],
+                    metrics["wrist_above_shoulder"],
+                    metrics["elbow_offset_px"],
+                    metrics["flare_threshold_px"],
+                )
+            else:
+                print(
+                    "Skipping angle analysis and feedback: missing pose landmarks or ball box on release frame."
+                )
+            release_found = True
+            break
+
+        if dist is not None:
+            prev_dist = dist
+        else:
+            prev_dist = None
+
         frame_number += 1
 
 cap.release()
-out.release()
 
-if init_bbox is None:
-    print("Warning: No ball found (YOLO or HSV). Output has skeleton only.")
-else:
-    print(f"Done! Saved: {output_video_path} (skeleton + ball from frame {init_frame_index})")
+if not release_found:
+    print(
+        "No release spike found. Try lowering NEAR_WRIST_FRAC or JUMP_FRAC, "
+        "or check that wrists and ball are visible when the ball leaves the hand."
+    )
